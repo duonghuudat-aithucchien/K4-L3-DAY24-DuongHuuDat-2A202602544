@@ -3,6 +3,12 @@ title = "Day 24 synthetic secret exercise"
 [extend]
 useDefault = true
 
+[allowlist]
+paths = [
+    '''(?i)^\.venv/''',
+    '''(?i)^\.pytest_tmp/''',
+]
+
 [[rules]]
 id = "lab24-synthetic-token"
 description = "A deliberately invalid lab token; never use real credentials"
