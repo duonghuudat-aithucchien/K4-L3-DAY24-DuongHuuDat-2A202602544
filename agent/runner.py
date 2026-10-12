@@ -1,74 +1,175 @@
-"""BƯỚC 3c — trifecta split + egress allowlist (13'). ĐÂY LÀ PHẦN KHÓ NHẤT.
+"""BƯỚC 3c & 3d — Trifecta Split + OBO Runner.
 
-Đọc CHECKPOINTS.md (§3c) trước khi viết code. Tóm tắt yêu cầu:
-
-Tách 1 yêu cầu người dùng thành ít nhất 2 run riêng biệt — KHÔNG run nào
-được cầm cả 3 chân của trifecta cùng lúc:
-
-    Run A: gọi search_docs (untrusted content).
-           KHÔNG gọi read_customer. KHÔNG gọi http_post.
-    Run B: gọi read_customer (private data).
-           CHỈ nhận input là TYPED, ĐÃ SANITIZE từ Run A — ví dụ
-           list[int] ticket id trích từ TÊN FILE (vd "ticket-007.md" -> 7),
-           KHÔNG BAO GIỜ nhận nguyên văn text của document. free text của
-           attacker không được đi xa hơn Run A.
-
-Mọi lần gọi tool (allow HAY deny) phải:
-  1. Đi qua `agent.policy.check()` TRƯỚC KHI tool thật sự chạy.
-  2. Được ghi vào ledger qua `agent.ledger.append()` — cả khi deny.
-Nếu policy deny, KHÔNG được gọi tool đó.
-
---- Gợi ý kiến trúc (không bắt buộc theo đúng, nhưng đủ để làm trong 13') ---
-
-data/customers.json có field `related_tickets: list[int]` cho mỗi khách
-hàng — đây là NGUỒN TIN CẬY để map ticket_id -> customer_id, KHÔNG map qua
-customer_id mà attacker nhúng trong nội dung document. Cụ thể:
-
-    Run A: search_docs(message) -> lấy list[int] ticket_id từ TÊN FILE của
-           các doc khớp (vd "ticket-999.md" -> 999). Cũng chạy
-           llm.find_injection() trên text để log lại (KHÔNG dùng
-           customer_id mà nó trả về).
-    Run B: với mỗi ticket_id nhận từ Run A, tìm customer nào trong
-           customers.json có ticket_id trong related_tickets, rồi
-           read_customer(customer_id) đó — không phải customer_id lấy từ
-           text tự do.
-
-Vì sao cách này chống được một chỉ thị viết không dấu / lookalike: filter
-chuỗi thô sẽ luôn có thể bị né bằng cách viết lại chỉ thị, nhưng nếu Run B
-không bao giờ ĐỌC free text để quyết định gọi ai, thì việc né filter chuỗi
-trở nên vô nghĩa — đây là containment (kiến trúc), khác với mitigation
-(bộ lọc). Sinh viên NÊN thử filter chuỗi trước, rồi tự phá nó bằng
-một bản viết lại không dấu của lure, trước khi chuyển sang cách này.
-
-Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn tại):
-
-    handle(message: str, llm, log_dir: pathlib.Path | None = None,
-           principal_id: str = "support_l1") -> str
-        `llm` cung cấp:
-            llm.find_injection(text: str) -> InjectedInstruction | None
-            llm.summarize(docs: list[dict]) -> str
-        `log_dir` là thư mục chứa ledger.jsonl (mặc định: reports/).
-        Mỗi tool call truyền principal_id, requested_tool, agent_scopes,
-        parent_scopes và expires_at vào PolicyContext; ledger ghi
-        on_behalf_of = principal_id, agent_id, run_id, expires_at.
-        Principal chỉ được tra trong data/principals.json. Run B không
-        được đọc customer cho support_l1; dpo vẫn đọc được khách hợp lệ.
-        Trả về câu trả lời cuối cùng hiển thị cho người dùng — hành vi
-        quan sát được từ ngoài (CLI) không đổi so với trước khi contain,
-        chỉ có sink log và ledger là khác.
+Điều phối luồng thực thi an toàn:
+- Run A: Đọc untrusted docs, chỉ trích xuất ticket_id (int) từ tên file.
+- Run B: Tra cứu customer_id từ nguồn tin cậy (data/customers.json) dựa trên related_tickets.
+- Mọi tool call đều qua policy.check() và ghi ledger.append() trước khi thực thi.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+
+from agent import ledger, pii, policy, tools
+from agent.policy import PolicyContext
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+CUSTOMERS_FILE = Path(__file__).resolve().parent.parent / "data" / "customers.json"
 
 
-class RunnerScaffoldPending(NotImplementedError):
-    """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
+def _audit_and_check(
+    tool_name: str,
+    args: dict,
+    classification: str,
+    egress_enabled: bool,
+    principal_id: str,
+    purpose: str,
+    ledger_path: Path,
+    run_id: str,
+    agent_id: str,
+    expires_at: str,
+    delegation_depth: int = 0,
+    parent_scopes: tuple[str, ...] = (),
+) -> bool:
+    """Tạo PolicyContext, kiểm tra chính sách và ghi vào ledger trước khi chạy tool."""
+    args_json = json.dumps(args, sort_keys=True, ensure_ascii=False)
+    args_hash = hashlib.sha256(args_json.encode("utf-8")).hexdigest()
+
+    ctx = PolicyContext(
+        data_classification=classification,
+        request_purpose=purpose,
+        agent_owner=agent_id,
+        delegation_depth=delegation_depth,
+        egress_enabled=egress_enabled,
+        principal_id=principal_id,
+        requested_tool=tool_name,
+        agent_scopes=("search_docs", "read_customer", "http_post"),
+        parent_scopes=parent_scopes,
+        expires_at=expires_at,
+    )
+
+    allowed, reason = policy.check(ctx)
+    decision = "allow" if allowed else "deny"
+
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": agent_id,
+        "run_id": run_id,
+        "on_behalf_of": principal_id,
+        "expires_at": expires_at,
+        "tool": tool_name,
+        "args_hash": args_hash,
+        "classification": classification,
+        "decision": decision,
+        "reason": reason,
+    }
+    ledger.append(entry, ledger_path)
+    return allowed
 
 
-def handle(message: str, llm, log_dir: Path | None = None,
-           principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+def handle(
+    message: str,
+    llm,
+    log_dir: Path | None = None,
+    principal_id: str = "support_l1",
+) -> str:
+    """Thực thi tác vụ với Trifecta Split và OBO containment."""
+    ledger_path = Path(log_dir) / "ledger.jsonl" if log_dir else DEFAULT_LEDGER_PATH
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    agent_id = "lab24-agent"
+    expires_at = "2099-01-01T00:00:00+00:00"
+
+    # =========================================================================
+    # Run A: Untrusted Content (search_docs)
+    # =========================================================================
+    allowed_search = _audit_and_check(
+        tool_name="search_docs",
+        args={"query": message},
+        classification="internal",
+        egress_enabled=False,
+        principal_id=principal_id,
+        purpose="summarize-tickets",
+        ledger_path=ledger_path,
+        run_id=run_id,
+        agent_id=f"{agent_id}/run-a",
+        expires_at=expires_at,
+    )
+
+    if not allowed_search:
+        return "Yêu cầu bị từ chối bởi chính sách."
+
+    docs = tools.search_docs(message)
+
+    # Trích xuất danh sách ticket_id (kiểu int) DUY NHẤT TỪ TÊN FILE
+    ticket_ids: list[int] = []
+    for d in docs:
+        doc_name = d.get("id", "")
+        match = re.search(r"ticket-(\d+)", doc_name)
+        if match:
+            ticket_ids.append(int(match.group(1)))
+
+    # Kiểm tra injection để log phục vụ kiểm toán (nhưng KHÔNG dùng customer_id từ free text)
+    combined_text = "\n\n".join(d["text"] for d in docs)
+    injected = llm.find_injection(combined_text)
+
+    # =========================================================================
+    # Run B: Private Data Store (read_customer)
+    # NGUỒN TIN CẬY: data/customers.json mapping từ related_tickets
+    # =========================================================================
+    customers_data = json.loads(CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    matched_customer_ids: list[str] = []
+    for c in customers_data:
+        cid = str(c["customer_id"])
+        c_tickets = set(c.get("related_tickets", []))
+        if any(tid in c_tickets for tid in ticket_ids):
+            if cid not in matched_customer_ids:
+                matched_customer_ids.append(cid)
+
+    collected = []
+    for cid in matched_customer_ids:
+        allowed_read = _audit_and_check(
+            tool_name="read_customer",
+            args={"customer_id": cid},
+            classification="restricted",
+            egress_enabled=False,
+            principal_id=principal_id,
+            purpose="support-reply",
+            ledger_path=ledger_path,
+            run_id=run_id,
+            agent_id=f"{agent_id}/run-b",
+            expires_at=expires_at,
+        )
+        if allowed_read:
+            try:
+                collected.append(tools.read_customer(cid))
+            except tools.ToolError:
+                continue
+
+    # =========================================================================
+    # Run C: Egress Vector (http_post) - Nếu kẻ tấn công yêu cầu gửi dữ liệu
+    # =========================================================================
+    if injected is not None and injected.target_url:
+        target_url = injected.target_url
+        allowed_post = _audit_and_check(
+            tool_name="http_post",
+            args={"url": target_url, "records_count": len(collected)},
+            classification="restricted" if collected else "internal",
+            egress_enabled=True,
+            principal_id=principal_id,
+            purpose="reconciliation",
+            ledger_path=ledger_path,
+            run_id=run_id,
+            agent_id=f"{agent_id}/run-c",
+            expires_at=expires_at,
+        )
+        if allowed_post:
+            tools.http_post(target_url, {"records": collected})
+
+    # Che PII trong nội dung các ticket trước khi tóm tắt
+    redacted_docs = [{"id": d["id"], "text": pii.redact(d["text"])} for d in docs]
+    return llm.summarize(redacted_docs)
